@@ -69,16 +69,20 @@ async function createPublicTunnel(port, deployId) {
 
     return new Promise((resolve, reject) => {
       let output = '';
+      let resolved = false;
       const timeout = setTimeout(() => {
-        console.log('Tunnel creation timeout, using localhost fallback');
-        tunnelProcess.kill();
-        resolve(null);
+        if (!resolved) {
+          console.log('Tunnel creation timeout, using localhost fallback');
+          tunnelProcess.kill();
+          resolve(null);
+        }
       }, 15000);
 
       const checkForUrl = (data) => {
         output += data.toString();
         const match = output.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/);
-        if (match) {
+        if (match && !resolved) {
+          resolved = true;
           clearTimeout(timeout);
           const tunnelUrl = match[0];
           console.log(`Tunnel created: ${tunnelUrl}`);
