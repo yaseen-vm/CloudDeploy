@@ -14,44 +14,129 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 const docker = new Docker();
-const upload = multer({ dest: 'uploads/' });
+const upload = multer({
+  dest: 'uploads/',
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit
+  fileFilter: (req, file, cb) => {
+    // Only accept files named 'Dockerfile' or with .dockerfile extension
+    if (file.originalname === 'Dockerfile' || file.originalname.endsWith('.dockerfile')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only Dockerfile uploads are allowed'));
+    }
+  }
+});
 const deployments = new Map();
 const tunnels = new Map();
+const MAX_DEPLOYMENTS = parseInt(process.env.MAX_DEPLOYMENTS || '50');
+const TUNNEL_TIMEOUT = parseInt(process.env.TUNNEL_TIMEOUT || '15000');
+const CONTAINER_CHECK_TIMEOUT = parseInt(process.env.CONTAINER_CHECK_TIMEOUT || '2000');
 
 // Database connection
 let db;
 async function initDB() {
-  try {
-    db = await mysql.createConnection({
-      host: process.env.DB_HOST || 'localhost',
-      user: process.env.DB_USER || 'clouddeploy',
-      password: process.env.DB_PASSWORD || 'password',
-      database: process.env.DB_NAME || 'clouddeploy'
-    });
+  let retries = 10;
+  let delay = 2000;
 
-    await db.execute(`
-      CREATE TABLE IF NOT EXISTS deployments (
-        id VARCHAR(255) PRIMARY KEY,
-        url VARCHAR(255),
-        localUrl VARCHAR(255),
-        container_id VARCHAR(255),
-        status VARCHAR(50),
-        type VARCHAR(50),
-        source VARCHAR(255),
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )
-    `);
+  while (retries > 0) {
+    try {
+      db = await mysql.createConnection({
+        host: process.env.DB_HOST || 'localhost',
+        user: process.env.DB_USER || 'clouddeploy',
+        password: process.env.DB_PASSWORD || 'password',
+        database: process.env.DB_NAME || 'clouddeploy'
+      });
 
-    console.log('Database connected');
-  } catch (error) {
-    console.error('Database error:', error);
-    setTimeout(initDB, 5000);
+      // Test connection
+      await db.execute('SELECT 1');
+
+      await db.execute(`
+        CREATE TABLE IF NOT EXISTS deployments (
+          id VARCHAR(255) PRIMARY KEY,
+          url VARCHAR(255),
+          localUrl VARCHAR(255),
+          container_id VARCHAR(255),
+          status VARCHAR(50),
+          type VARCHAR(50),
+          source VARCHAR(255),
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+
+      console.log('✅ Database connected successfully');
+      return;
+    } catch (error) {
+      retries--;
+      console.error(`❌ Database connection failed. Retries left: ${retries}`);
+      console.error(`Error: ${error.message}`);
+
+      if (retries === 0) {
+        console.error('⚠️  Failed to connect to database after all retries. App will continue without database.');
+        return;
+      }
+
+      await new Promise(resolve => setTimeout(resolve, delay));
+      delay = Math.min(delay * 1.5, 15000); // Exponential backoff, max 15s
+    }
   }
 }
 
-// Generate random port
+// Create required directories
+const requiredDirs = ['uploads', 'deployments', path.join(__dirname, 'deployments')];
+requiredDirs.forEach(dir => {
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+    console.log(`📁 Created directory: ${dir}`);
+  }
+});
+
+// Generate random port with conflict checking
+const usedPorts = new Set();
+
 function getRandomPort() {
-  return Math.floor(Math.random() * (9999 - 5000) + 5000);
+  let attempts = 0;
+  while (attempts < 100) {
+    const port = Math.floor(Math.random() * (9999 - 5000) + 5000);
+    if (!usedPorts.has(port)) {
+      usedPorts.add(port);
+      return port;
+    }
+    attempts++;
+  }
+  throw new Error('Unable to find available port');
+}
+
+function releasePort(port) {
+  if (port) {
+    usedPorts.delete(port);
+    console.log(`🔓 Released port: ${port}`);
+  }
+}
+
+// Input validation helpers
+function validateDockerImage(image) {
+  if (!image || typeof image !== 'string') return false;
+  // Basic validation: alphanumeric, dots, slashes, colons, hyphens, underscores
+  const imageRegex = /^[a-zA-Z0-9._\/-]+:[a-zA-Z0-9._-]+$|^[a-zA-Z0-9._\/-]+$/;
+  return imageRegex.test(image) && image.length < 256;
+}
+
+function validatePort(port) {
+  const portNum = parseInt(port);
+  return !isNaN(portNum) && portNum > 0 && portNum <= 65535;
+}
+
+function validateGitRepo(repo) {
+  if (!repo || typeof repo !== 'string') return false;
+  // Allow http(s) and git protocols
+  const repoRegex = /^(https?:\/\/|git@)[\w\.-]+[\/:]([\w\.-]+\/)*[\w\.-]+(\.git)?$/;
+  return repoRegex.test(repo) && repo.length < 512;
+}
+
+function checkDeploymentLimit() {
+  if (deployments.size >= MAX_DEPLOYMENTS) {
+    throw new Error(`Deployment limit reached (${MAX_DEPLOYMENTS}). Please delete some deployments first.`);
+  }
 }
 
 // Create public tunnel for a port using Cloudflare
@@ -76,7 +161,7 @@ async function createPublicTunnel(port, deployId) {
           tunnelProcess.kill();
           resolve(null);
         }
-      }, 15000);
+      }, TUNNEL_TIMEOUT);
 
       const checkForUrl = (data) => {
         output += data.toString();
@@ -129,10 +214,23 @@ app.use('/api', express.Router());
 
 // Deploy from Docker image
 app.post('/api/deploy/docker', async (req, res) => {
+  let hostPort = null;
   try {
     const { image, port: appPort = '3000' } = req.body;
+
+    // Input validation
+    if (!validateDockerImage(image)) {
+      return res.status(400).json({ error: 'Invalid Docker image name' });
+    }
+    if (!validatePort(appPort)) {
+      return res.status(400).json({ error: 'Invalid port number' });
+    }
+
+    // Check deployment limit
+    checkDeploymentLimit();
+
     const deployId = uuidv4().substring(0, 8);
-    const hostPort = getRandomPort();
+    hostPort = getRandomPort();
 
     // Send progress updates
     const sendProgress = (step, progress) => {
@@ -176,31 +274,53 @@ app.post('/api/deploy/docker', async (req, res) => {
 
     sendProgress('Starting container...', 80);
 
-    // Wait and check if container is actually running
-    setTimeout(async () => {
-      try {
-        const info = await container.inspect();
-        if (!info.State.Running) {
-          console.log(`Container ${deployId} failed to start`);
-          const dep = deployments.get(deployId);
-          if (dep) dep.status = 'failed';
-        }
-      } catch (err) {
-        console.error('Container check failed:', err);
-      }
-    }, 3000);
+    // Wait and verify container is actually running
+    await new Promise(resolve => setTimeout(resolve, 3000));
 
-    sendProgress('Deployment complete!', 100);
+    const containerInfo = await container.inspect();
+    if (!containerInfo.State.Running) {
+      // Container failed to start
+      sendProgress('Container failed to start', 100);
+      releasePort(hostPort);
+
+      // Get logs for debugging
+      let errorLogs = 'No logs available';
+      try {
+        const logs = await container.logs({ stdout: true, stderr: true, tail: 50 });
+        errorLogs = logs.toString();
+      } catch (e) {
+        // Ignore log fetch errors
+      }
+
+      // Clean up failed container
+      try {
+        await container.remove({ force: true });
+      } catch (e) {
+        console.error('Failed to remove failed container:', e);
+      }
+
+      return res.status(500).json({
+        error: 'Container failed to start',
+        logs: errorLogs
+      });
+    }
+
+    sendProgress('Container running successfully!', 90);
 
     // Wait for container to be ready before creating tunnel
-    const waitForContainer = async (port, maxAttempts = 10) => {
+    const waitForContainer = async (containerId, appPort, maxAttempts = 10) => {
       for (let i = 0; i < maxAttempts; i++) {
         try {
-          await axios.get(`http://localhost:${port}`, { timeout: 2000 });
-          console.log(`Container on port ${port} is ready`);
-          return true;
+          const containerInfo = await docker.getContainer(containerId).inspect();
+          const containerIP = containerInfo.NetworkSettings.IPAddress;
+
+          if (containerIP) {
+            await axios.get(`http://${containerIP}:${appPort}`, { timeout: 2000 });
+            console.log(`Container ${containerId.substring(0, 12)} is ready`);
+            return true;
+          }
         } catch (err) {
-          console.log(`Waiting for container on port ${port}... (${i + 1}/${maxAttempts})`);
+          console.log(`Waiting for container... (${i + 1}/${maxAttempts})`);
           await new Promise(resolve => setTimeout(resolve, 2000));
         }
       }
@@ -208,10 +328,9 @@ app.post('/api/deploy/docker', async (req, res) => {
     };
 
     // Create Cloudflare tunnel after container is ready
-    waitForContainer(hostPort).then(async (ready) => {
+    waitForContainer(container.id, appPort).then(async (ready) => {
       if (!ready) {
-        console.log(`Container on port ${hostPort} not ready, skipping tunnel creation`);
-        return;
+        console.log(`Container not ready after waiting, creating tunnel anyway`);
       }
 
       const tunnelUrl = await createPublicTunnel(hostPort, deployId);
@@ -241,7 +360,9 @@ app.post('/api/deploy/docker', async (req, res) => {
       status: 'running',
       type: 'docker',
       source: image,
-      hasPublicUrl: !!tunnelUrl
+      hasPublicUrl: !!tunnelUrl,
+      hostPort: hostPort, // Track port for cleanup
+      createdAt: new Date().toISOString()
     };
 
     deployments.set(deployId, deployment);
@@ -256,17 +377,41 @@ app.post('/api/deploy/docker', async (req, res) => {
 
     res.json({ success: true, deploymentId: deployId, url: deployment.url });
   } catch (error) {
+    console.error('Deployment error:', error);
+    // Release port on error
+    if (hostPort) {
+      releasePort(hostPort);
+    }
     res.status(500).json({ error: error.message });
   }
 });
 
 // Deploy from Git repository
 app.post('/api/deploy/git', async (req, res) => {
+  let hostPort = null;
+  let buildDir = null;
   try {
     const { repo, port: appPort = '3000' } = req.body;
+
+    // Input validation
+    if (!validateGitRepo(repo)) {
+      return res.status(400).json({ error: 'Invalid Git repository URL' });
+    }
+    if (!validatePort(appPort)) {
+      return res.status(400).json({ error: 'Invalid port number' });
+    }
+
+    // Check deployment limit
+    checkDeploymentLimit();
+
     const deployId = uuidv4().substring(0, 8);
-    const hostPort = getRandomPort();
-    const buildDir = `/tmp/build-${deployId}`;
+    hostPort = getRandomPort();
+    buildDir = path.join(__dirname, 'deployments', `build-${deployId}`);
+
+    // Ensure build directory exists
+    if (!fs.existsSync(path.join(__dirname, 'deployments'))) {
+      fs.mkdirSync(path.join(__dirname, 'deployments'), { recursive: true });
+    }
 
     // Send progress updates
     const sendProgress = (step, progress) => {
@@ -317,7 +462,10 @@ app.post('/api/deploy/git', async (req, res) => {
       status: 'running',
       type: 'git',
       source: repo,
-      hasPublicUrl: false
+      hasPublicUrl: false,
+      hostPort: hostPort, // Track port for cleanup
+      buildDir: buildDir, // Track build dir for cleanup
+      createdAt: new Date().toISOString()
     };
 
     deployments.set(deployId, deployment);
@@ -340,17 +488,52 @@ app.post('/api/deploy/git', async (req, res) => {
       }
     }).catch(err => console.error('Tunnel creation failed:', err));
 
+    // Clean up build directory after successful deployment
+    if (buildDir && fs.existsSync(buildDir)) {
+      setTimeout(() => {
+        try {
+          fs.rmSync(buildDir, { recursive: true, force: true });
+          console.log(`🗑️  Cleaned up build directory: ${buildDir}`);
+        } catch (err) {
+          console.error('Failed to clean up build directory:', err);
+        }
+      }, 5000); // Wait 5s to ensure image is built
+    }
+
     res.json({ success: true, deploymentId: deployId, url: deployment.url });
   } catch (error) {
+    console.error('Git deployment error:', error);
+    // Release port on error
+    if (hostPort) {
+      releasePort(hostPort);
+    }
+    // Clean up build directory on error
+    if (buildDir && fs.existsSync(buildDir)) {
+      try {
+        fs.rmSync(buildDir, { recursive: true, force: true });
+      } catch (err) {
+        console.error('Failed to clean up build directory:', err);
+      }
+    }
     res.status(500).json({ error: error.message });
   }
 });
 
 // Deploy from uploaded Dockerfile
 app.post('/api/deploy/dockerfile', upload.single('dockerfile'), async (req, res) => {
+  let port = null;
+  let uploadedFile = null;
   try {
+    // Check deployment limit
+    checkDeploymentLimit();
+
+    if (!req.file) {
+      return res.status(400).json({ error: 'No Dockerfile uploaded' });
+    }
+
+    uploadedFile = req.file.path;
     const deployId = uuidv4().substring(0, 8);
-    const port = getRandomPort();
+    port = getRandomPort();
 
     // Send progress updates
     const sendProgress = (step, progress) => {
@@ -403,13 +586,40 @@ app.post('/api/deploy/dockerfile', upload.single('dockerfile'), async (req, res)
       status: 'running',
       type: 'dockerfile',
       source: 'uploaded',
-      hasPublicUrl: !!tunnelUrl
+      hasPublicUrl: !!tunnelUrl,
+      hostPort: port, // Track port for cleanup
+      createdAt: new Date().toISOString()
     };
 
     deployments.set(deployId, deployment);
 
+    // Clean up uploaded file
+    if (uploadedFile && fs.existsSync(uploadedFile)) {
+      setTimeout(() => {
+        try {
+          fs.unlinkSync(uploadedFile);
+          console.log(`🗑️  Cleaned up uploaded file: ${uploadedFile}`);
+        } catch (err) {
+          console.error('Failed to clean up uploaded file:', err);
+        }
+      }, 5000);
+    }
+
     res.json({ success: true, deploymentId: deployId, url: deployment.url });
   } catch (error) {
+    console.error('Dockerfile deployment error:', error);
+    // Release port on error
+    if (port) {
+      releasePort(port);
+    }
+    // Clean up uploaded file on error
+    if (uploadedFile && fs.existsSync(uploadedFile)) {
+      try {
+        fs.unlinkSync(uploadedFile);
+      } catch (err) {
+        console.error('Failed to clean up uploaded file:', err);
+      }
+    }
     res.status(500).json({ error: error.message });
   }
 });
@@ -427,26 +637,73 @@ app.delete('/api/deploy/:id', async (req, res) => {
       return res.status(404).json({ error: 'Deployment not found' });
     }
 
-    const container = docker.getContainer(deployment.container);
-    await container.stop();
-    await container.remove();
+    const errors = [];
 
-    // Close tunnel if exists
-    const tunnel = tunnels.get(req.params.id);
-    if (tunnel) {
-      tunnel.close();
-      tunnels.delete(req.params.id);
+    // Stop and remove container (handle errors gracefully)
+    try {
+      const container = docker.getContainer(deployment.container);
+      try {
+        await container.stop({ t: 10 }); // 10 second timeout
+      } catch (stopErr) {
+        // Container might already be stopped
+        console.log(`Container already stopped or error stopping: ${stopErr.message}`);
+      }
+      await container.remove({ force: true });
+      console.log(`✅ Removed container: ${deployment.container.substring(0, 12)}`);
+    } catch (containerErr) {
+      console.error('Container cleanup error:', containerErr);
+      errors.push(`Container cleanup failed: ${containerErr.message}`);
     }
 
+    // Close tunnel if exists
+    try {
+      const tunnel = tunnels.get(req.params.id);
+      if (tunnel) {
+        tunnel.close();
+        tunnels.delete(req.params.id);
+        console.log(`✅ Closed tunnel for deployment: ${req.params.id}`);
+      }
+    } catch (tunnelErr) {
+      console.error('Tunnel cleanup error:', tunnelErr);
+      errors.push(`Tunnel cleanup failed: ${tunnelErr.message}`);
+    }
+
+    // Release port
+    if (deployment.hostPort) {
+      releasePort(deployment.hostPort);
+    }
+
+    // Clean up build directory if it exists
+    if (deployment.buildDir && fs.existsSync(deployment.buildDir)) {
+      try {
+        fs.rmSync(deployment.buildDir, { recursive: true, force: true });
+        console.log(`✅ Cleaned up build directory: ${deployment.buildDir}`);
+      } catch (dirErr) {
+        console.error('Build directory cleanup error:', dirErr);
+        errors.push(`Build directory cleanup failed: ${dirErr.message}`);
+      }
+    }
+
+    // Remove from memory
     deployments.delete(req.params.id);
 
     // Delete from database
     if (db) {
-      await db.execute('DELETE FROM deployments WHERE id = ?', [req.params.id]);
+      try {
+        await db.execute('DELETE FROM deployments WHERE id = ?', [req.params.id]);
+      } catch (dbErr) {
+        console.error('Database deletion error:', dbErr);
+        errors.push(`Database deletion failed: ${dbErr.message}`);
+      }
     }
 
-    res.json({ success: true });
+    if (errors.length > 0) {
+      res.json({ success: true, warnings: errors });
+    } else {
+      res.json({ success: true });
+    }
   } catch (error) {
+    console.error('Deployment deletion error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -458,9 +715,13 @@ app.get('/api/health', (req, res) => {
 
 // Test deployment with simple web server
 app.post('/api/deploy/test', async (req, res) => {
+  let hostPort = null;
   try {
+    // Check deployment limit
+    checkDeploymentLimit();
+
     const deployId = uuidv4().substring(0, 8);
-    const hostPort = getRandomPort();
+    hostPort = getRandomPort();
 
     // Pull nginx image first
     const pullStream = await docker.pull('nginx:alpine');
@@ -496,13 +757,19 @@ app.post('/api/deploy/test', async (req, res) => {
       status: 'running',
       type: 'test',
       source: 'nginx:alpine',
-      hasPublicUrl: !!tunnelUrl
+      hasPublicUrl: !!tunnelUrl,
+      hostPort: hostPort,
+      createdAt: new Date().toISOString()
     };
 
     deployments.set(deployId, deployment);
 
     res.json({ success: true, deploymentId: deployId, url: deployment.url });
   } catch (error) {
+    console.error('Test deployment error:', error);
+    if (hostPort) {
+      releasePort(hostPort);
+    }
     res.status(500).json({ error: error.message });
   }
 });
@@ -616,9 +883,76 @@ wss.on('connection', (ws) => {
   ws.on('close', () => console.log('Client disconnected'));
 });
 
-initDB().then(() => {
+// Load deployments from database on startup
+async function loadDeploymentsFromDB() {
+  if (!db) {
+    console.log('⚠️  Database not available, skipping deployment restoration');
+    return;
+  }
+
+  try {
+    const [rows] = await db.execute('SELECT * FROM deployments');
+    console.log(`📦 Found ${rows.length} deployments in database`);
+
+    for (const row of rows) {
+      // Verify container still exists
+      try {
+        const container = docker.getContainer(row.container_id);
+        const info = await container.inspect();
+
+        const deployment = {
+          id: row.id,
+          url: row.url,
+          localUrl: row.localUrl,
+          container: row.container_id,
+          status: info.State.Running ? 'running' : 'stopped',
+          type: row.type,
+          source: row.source,
+          hasPublicUrl: row.url && !row.url.includes('localhost'),
+          createdAt: row.created_at
+        };
+
+        deployments.set(row.id, deployment);
+        console.log(`✅ Restored deployment: ${row.id}`);
+      } catch (err) {
+        // Container doesn't exist anymore, clean up DB
+        console.log(`⚠️  Container ${row.container_id.substring(0, 12)} not found, removing from DB`);
+        await db.execute('DELETE FROM deployments WHERE id = ?', [row.id]);
+      }
+    }
+
+    console.log(`✅ Loaded ${deployments.size} active deployments`);
+  } catch (error) {
+    console.error('Failed to load deployments from database:', error);
+  }
+}
+
+// Cleanup orphaned tunnel processes on startup
+async function cleanupOrphanedTunnels() {
+  try {
+    // Kill any existing cloudflared processes
+    if (process.platform === 'win32') {
+      execSync('taskkill /F /IM cloudflared.exe 2>nul', { stdio: 'ignore' });
+    } else {
+      execSync('pkill -9 cloudflared 2>/dev/null || true', { stdio: 'ignore' });
+    }
+    console.log('✅ Cleaned up orphaned tunnel processes');
+  } catch (error) {
+    // Ignore errors - processes might not exist
+  }
+}
+
+initDB().then(async () => {
+  // Clean up orphaned processes
+  await cleanupOrphanedTunnels();
+
+  // Load existing deployments
+  await loadDeploymentsFromDB();
+
   server.listen(3000, () => {
-    console.log('CloudDeploy running on port 3000');
-    console.log('Dashboard: http://localhost:3000');
+    console.log('🚀 CloudDeploy running on port 3000');
+    console.log('📊 Dashboard: http://localhost:3000');
+    console.log(`📦 Active deployments: ${deployments.size}`);
+    console.log(`🔒 Max deployments: ${MAX_DEPLOYMENTS}`);
   });
 });
