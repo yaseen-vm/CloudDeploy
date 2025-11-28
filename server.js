@@ -75,7 +75,7 @@ async function createPublicTunnel(port, deployId) {
         resolve(null);
       }, 15000);
 
-      tunnelProcess.stdout.on('data', (data) => {
+      const checkForUrl = (data) => {
         output += data.toString();
         const match = output.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/);
         if (match) {
@@ -89,11 +89,10 @@ async function createPublicTunnel(port, deployId) {
           });
           resolve(tunnelUrl);
         }
-      });
+      };
 
-      tunnelProcess.stderr.on('data', (data) => {
-        console.log('Tunnel stderr:', data.toString());
-      });
+      tunnelProcess.stdout.on('data', checkForUrl);
+      tunnelProcess.stderr.on('data', checkForUrl);
 
       tunnelProcess.on('error', (error) => {
         clearTimeout(timeout);
