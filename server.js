@@ -192,8 +192,29 @@ app.post('/api/deploy/docker', async (req, res) => {
 
     sendProgress('Deployment complete!', 100);
 
-    // Create Cloudflare tunnel asynchronously (non-blocking)
-    createPublicTunnel(hostPort, deployId).then(tunnelUrl => {
+    // Wait for container to be ready before creating tunnel
+    const waitForContainer = async (port, maxAttempts = 10) => {
+      for (let i = 0; i < maxAttempts; i++) {
+        try {
+          await axios.get(`http://localhost:${port}`, { timeout: 2000 });
+          console.log(`Container on port ${port} is ready`);
+          return true;
+        } catch (err) {
+          console.log(`Waiting for container on port ${port}... (${i + 1}/${maxAttempts})`);
+          await new Promise(resolve => setTimeout(resolve, 2000));
+        }
+      }
+      return false;
+    };
+
+    // Create Cloudflare tunnel after container is ready
+    waitForContainer(hostPort).then(async (ready) => {
+      if (!ready) {
+        console.log(`Container on port ${hostPort} not ready, skipping tunnel creation`);
+        return;
+      }
+
+      const tunnelUrl = await createPublicTunnel(hostPort, deployId);
       if (tunnelUrl) {
         const dep = deployments.get(deployId);
         if (dep) {
