@@ -47,7 +47,9 @@
     <div class="container">
         <div class="header">
             <h1><i class="fas fa-cloud"></i> CloudDeploy</h1>
+            <h1><i class="fas fa-cloud"></i> CloudDeploy</h1>
             <p>Deploy Docker containers instantly with beautiful dashboard</p>
+            <p id="ws-status" style="font-size: 0.8rem; margin-top: 5px;"><i class="fas fa-circle" style="color: grey;"></i> Connecting...</p>
         </div>
         
         <div class="dashboard">
@@ -237,7 +239,26 @@
         
         // WebSocket connection
         const ws = new WebSocket(`ws://${window.location.host}`);
+        
+        const statusEl = document.getElementById('ws-status');
+        
+        ws.onopen = () => {
+            console.log('WS Connected');
+            statusEl.innerHTML = '<i class="fas fa-circle" style="color: #2ecc71;"></i> Connected';
+        };
+        
+        ws.onclose = () => {
+            console.log('WS Disconnected');
+            statusEl.innerHTML = '<i class="fas fa-circle" style="color: #e74c3c;"></i> Disconnected';
+        };
+        
+        ws.onerror = (err) => {
+            console.error('WS Error:', err);
+            statusEl.innerHTML = '<i class="fas fa-circle" style="color: #e74c3c;"></i> Error';
+        };
+
         ws.onmessage = (event) => {
+            console.log('WS Message:', event.data);
             const data = JSON.parse(event.data);
             if (data.type === 'progress') {
                 updateProgress(data.step, data.progress);

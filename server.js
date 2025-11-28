@@ -54,18 +54,59 @@ function getRandomPort() {
   return Math.floor(Math.random() * (9999 - 5000) + 5000);
 }
 
-// Create public tunnel for a port
+// Create public tunnel for a port using Cloudflare
 async function createPublicTunnel(port, deployId) {
   try {
-    console.log(`Creating public tunnel for port ${port}...`);
-    const ngrok = require('ngrok');
+    console.log(`Creating Cloudflare tunnel for port ${port}...`);
 
-    const tunnelUrl = await ngrok.connect(port);
+    const tunnelProcess = spawn('cloudflared', [
+      'tunnel',
+      '--url', `http://localhost:${port}`,
+      '--no-autoupdate'
+    ], {
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
 
-    console.log(`Tunnel created: ${tunnelUrl}`);
-    tunnels.set(deployId, { url: tunnelUrl, close: () => ngrok.disconnect(tunnelUrl) });
+    return new Promise((resolve, reject) => {
+      let output = '';
+      const timeout = setTimeout(() => {
+        console.log('Tunnel creation timeout, using localhost fallback');
+        tunnelProcess.kill();
+        resolve(null);
+      }, 15000);
 
-    return tunnelUrl;
+      tunnelProcess.stdout.on('data', (data) => {
+        output += data.toString();
+        const match = output.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/);
+        if (match) {
+          clearTimeout(timeout);
+          const tunnelUrl = match[0];
+          console.log(`Tunnel created: ${tunnelUrl}`);
+          tunnels.set(deployId, {
+            url: tunnelUrl,
+            process: tunnelProcess,
+            close: () => tunnelProcess.kill()
+          });
+          resolve(tunnelUrl);
+        }
+      });
+
+      tunnelProcess.stderr.on('data', (data) => {
+        console.log('Tunnel stderr:', data.toString());
+      });
+
+      tunnelProcess.on('error', (error) => {
+        clearTimeout(timeout);
+        console.error('Tunnel process error:', error);
+        resolve(null);
+      });
+
+      tunnelProcess.on('exit', (code) => {
+        if (code !== 0 && code !== null) {
+          console.log(`Tunnel process exited with code ${code}`);
+        }
+      });
+    });
   } catch (error) {
     console.error('Tunnel creation error:', error);
     return null;
@@ -367,8 +408,8 @@ app.delete('/api/deploy/:id', async (req, res) => {
     await container.remove();
 
     // Close tunnel if exists
-    const tunnelProcess = tunnels.get(req.params.id);
-    if (tunnelProcess) {
+    const tunnel = tunnels.get(req.params.id);
+    if (tunnel) {
       tunnel.close();
       tunnels.delete(req.params.id);
     }
